@@ -101,8 +101,9 @@ floating overlay, so the block position in the document does not matter.
 
 Enable the assistant across pages that match a URL pattern by adding an
 `ASSISTANT_PATHS` array to `loadDelayed()` in `scripts/scripts.js`. Patterns are
-RegExps, or strings treated as anchored globs (`/blog/*` matches `/blog/x` but not
-`/catalog/blog/x`; `/*` matches every page):
+RegExps, or strings treated as anchored globs (`/blog/*` matches `/blog/` and
+`/blog/x` but not `/catalog/blog/x`; `/*` matches every page). Error pages
+(`window.isErrorPage`, set by the boilerplate's `404.html`) are always skipped:
 
 ```js
 // scripts/scripts.js — inside loadDelayed()
@@ -184,7 +185,9 @@ Actions are declarative. `ACTIONS`, `runSummary` and `runChat` are exported, so
 you can add one from `scripts/scripts.js` before the assistant mounts:
 
 ```js
-import('../blocks/page-assistant/page-assistant.js').then(({ ACTIONS, runSummary, runChat }) => {
+import('../blocks/page-assistant/page-assistant.js').then(({
+  ACTIONS, runSummary, runChat,
+}) => {
   ACTIONS.push({
     id: 'key-points',
     label: 'Key points',

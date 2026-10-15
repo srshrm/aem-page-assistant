@@ -997,6 +997,8 @@ function pathMatcher(pattern) {
  */
 export function autoMountByPath(patterns, config) {
   try {
+    // A 404 served for a matching path has no content worth asking about.
+    if (window.isErrorPage) return;
     const list = (patterns || []).map(pathMatcher);
     const path = window.location.pathname;
     if (!list.some((re) => re.test(path))) return;
