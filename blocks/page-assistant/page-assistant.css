@@ -503,9 +503,21 @@
   opacity: 0.5;
 }
 
-/* While a response is streaming, the send button becomes a Stop control. */
+/* While a response is streaming, the send button becomes a Stop control. It
+   keeps the accent (a faded fill would read as disabled) and pulses softly to
+   show work is in progress. */
 .page-assistant-send.page-assistant-send-stop {
-  background: color-mix(in srgb, var(--pa-text) 55%, transparent);
+  animation: page-assistant-pulse 1.6s ease-out infinite;
+}
+
+@keyframes page-assistant-pulse {
+  from {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pa-accent) 45%, transparent);
+  }
+
+  to {
+    box-shadow: 0 0 0 0.5rem color-mix(in srgb, var(--pa-accent) 0%, transparent);
+  }
 }
 
 .page-assistant-send.page-assistant-send-stop svg {
@@ -532,6 +544,7 @@
   .page-assistant-bubble-icon,
   .page-assistant-panel,
   .page-assistant-msg,
+  .page-assistant-send,
   .page-assistant-typing i {
     transition: none;
     animation: none;
