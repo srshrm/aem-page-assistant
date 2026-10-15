@@ -1,14 +1,15 @@
 // page-assistant.js — a reusable, floating "ask this page" chat assistant that
 // runs entirely on Chrome's built-in AI (Prompt API `LanguageModel` / Gemini
-// Nano, plus the Summarizer API when available). No backend, no API key, no
-// model download managed by us. Answers are grounded ONLY in the current page's
-// text, which is extracted and handed to the on-device model.
+// Nano, plus the Summarizer, Translator and Language Detector APIs when
+// available). No backend, no API key, no model download managed by us. Answers
+// are grounded ONLY in the current page's text, which is extracted and handed
+// to the on-device model.
 //
 // DESIGN CONTRACT (why it is safe on an EDS site):
 //   * The bubble is only ever rendered when built-in AI is ACTUALLY available on
 //     the device. If it is not, nothing is added to the page.
-//   * All detection, CSS loading and mounting happen off the critical path — in
-//     the delayed phase / on idle — so Lighthouse is unaffected.
+//   * Detection and mounting happen on idle, after the page has loaded, so they
+//     never hold up section loading or LCP.
 //   * The floating UI is `position: fixed`, so it never causes layout shift.
 //   * Nothing the user types ever leaves the device.
 //
@@ -16,13 +17,18 @@
 //   1. Authored — drop a `page-assistant` block on a page. `decorate(block)`
 //      reads its config and mounts the assistant.
 //   2. Global — call `autoMountByPath(patterns, config)` from `scripts.js` to
-//      show it across many pages that match a URL regex, with no authoring.
+//      show it across many pages that match a URL pattern, with no authoring.
 
 import { readBlockConfig, loadCSS } from '../../scripts/aem.js';
 
 // Singleton guard: only one assistant per page, no matter how many triggers fire
 // (an authored block AND a global auto-mount, multiple matching patterns, etc.).
 const MOUNT_FLAG = '__pageAssistantMounted';
+// Set synchronously by an authored block so the global auto-mount always defers
+// to it, even while the authored mount is still waiting for idle time.
+const AUTHORED_FLAG = '__pageAssistantAuthored';
+
+const SUMMARY_TYPES = ['tldr', 'key-points', 'teaser', 'headline'];
 
 const DEFAULT_CONFIG = {
   subtext: 'Answers are based on this page. Nothing you type leaves your device.',
@@ -40,52 +46,79 @@ const DEFAULT_CONFIG = {
   showWhenDownloadable: false,
 };
 
+// Run a callback once the browser is idle, off the critical path.
+function onIdle(fn) {
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(fn, { timeout: 3000 });
+  } else {
+    window.setTimeout(fn, 1200);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Built-in AI access
 // ---------------------------------------------------------------------------
 
-// Prompt API handle across the shipped shapes: `window.LanguageModel` (current)
-// and the older `window.ai.languageModel`.
 function languageModelApi() {
-  return window.LanguageModel || (window.ai && window.ai.languageModel) || null;
+  return window.LanguageModel || null;
 }
 
 function summarizerApi() {
-  return window.Summarizer || (window.ai && window.ai.summarizer) || null;
+  return window.Summarizer || null;
 }
 
-// Cheap synchronous sniff — safe to call anywhere. Real availability needs the
-// async probe below.
-function builtinPresent() {
-  return !!languageModelApi();
+function translatorApi() {
+  return window.Translator || null;
 }
 
-// Async availability probe. Returns { ok, state } where state is one of
-// 'available' | 'downloadable' | 'unavailable'. Handles both the modern
-// `availability()` and the older `capabilities()` API shapes.
+function languageDetectorApi() {
+  return window.LanguageDetector || null;
+}
+
+// The page language (e.g. `en` from `<html lang="en-US">`), used as the model's
+// expected input/output language. Chrome warns, and may refuse, when it isn't
+// declared.
+function pageLanguage() {
+  return (document.documentElement.lang || 'en').toLowerCase().split('-')[0] || 'en';
+}
+
+// Prompt API options declaring the conversation language.
+function languageModelOptions(language) {
+  return {
+    expectedInputs: [{ type: 'text', languages: [language] }],
+    expectedOutputs: [{ type: 'text', languages: [language] }],
+  };
+}
+
+// The model is usable now or after a (possibly in-progress) download.
+function isDownloadState(state) {
+  return state === 'downloadable' || state === 'downloading';
+}
+
+// Async availability probe. Returns { state, language } where state is one of
+// 'available' | 'downloadable' | 'downloading' | 'unavailable'. If the page
+// language isn't supported by the model, falls back to English.
 async function probeAvailability() {
   const lm = languageModelApi();
-  if (!lm) return { ok: false, state: 'unavailable' };
-  try {
-    let state;
-    if (typeof lm.availability === 'function') {
-      state = await lm.availability();
-    } else if (typeof lm.capabilities === 'function') {
-      const caps = await lm.capabilities();
-      const map = { readily: 'available', 'after-download': 'downloadable', no: 'unavailable' };
-      state = map[caps.available] || 'unavailable';
+  if (!lm || typeof lm.availability !== 'function') return { state: 'unavailable' };
+  const candidates = [...new Set([pageLanguage(), 'en'])];
+  // eslint-disable-next-line no-restricted-syntax
+  for (const language of candidates) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const state = await lm.availability(languageModelOptions(language));
+      if (state && state !== 'unavailable') return { state, language };
+    } catch (err) {
+      // Try the next language.
     }
-    if (!state || state === 'unavailable') return { ok: false, state: 'unavailable' };
-    return { ok: true, state };
-  } catch (err) {
-    return { ok: false, state: 'unavailable' };
   }
+  return { state: 'unavailable' };
 }
 
 // Should we show the bubble for this availability state?
 function shouldRender(state, config) {
   if (state === 'available') return true;
-  if (state === 'downloadable') return !!config.showWhenDownloadable;
+  if (isDownloadState(state)) return !!config.showWhenDownloadable;
   return false;
 }
 
@@ -93,6 +126,11 @@ function shouldRender(state, config) {
 // Page text extraction — the grounding context. Pulls readable main-content
 // text, excluding the assistant's own UI and non-content chrome.
 // ---------------------------------------------------------------------------
+// Elements that start a new line of text. Decorated blocks often move elements
+// around without the whitespace between them, so without these breaks
+// `textContent` would glue words from adjacent elements together.
+const BLOCK_ELEMENTS = 'address, article, blockquote, dd, div, dl, dt, figcaption, figure, h1, h2, h3, h4, h5, h6, hr, li, ol, p, pre, section, table, td, th, tr, ul, br';
+
 // Cache the full main-content text (static for the life of the page) so we
 // clone-and-scan once and just re-slice per call.
 let pageTextCache = null;
@@ -104,7 +142,11 @@ function extractPageText(maxChars) {
     clone
       .querySelectorAll('.page-assistant, .page-assistant-root, script, style, noscript, nav, header, footer, aside, form')
       .forEach((node) => node.remove());
-    pageTextCache = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+    clone.querySelectorAll(BLOCK_ELEMENTS).forEach((node) => node.after('\n'));
+    pageTextCache = (clone.textContent || '')
+      .replace(/[^\S\n]+/g, ' ')
+      .replace(/ ?\n\s*/g, '\n')
+      .trim();
   }
   return pageTextCache.slice(0, maxChars);
 }
@@ -122,47 +164,58 @@ function buildSystemPrompt(config) {
 }
 
 // Shared download-progress monitor for every on-device model `create()` call.
+// `loaded` is a 0–1 fraction in current builds (`total` is 1).
 function downloadMonitor(ctx) {
   return (m) => {
     m.addEventListener('downloadprogress', (e) => {
-      const pct = e.total ? Math.round((e.loaded / e.total) * 100) : 0;
+      const pct = Math.round((e.loaded / (e.total || 1)) * 100);
       if (ctx.onProgress) ctx.onProgress(pct);
     });
   };
 }
 
-// True only for an "unsupported option shape" error, so we don't mask a real
-// quota/permission failure by blindly retrying with a different create() shape.
-function isOptionShapeError(err) {
-  if (!err) return false;
-  if (err.name === 'TypeError') return true;
-  const msg = `${err.name || ''} ${err.message || ''}`.toLowerCase();
-  return msg.includes('initialprompts') || msg.includes('unexpected')
-    || msg.includes('unknown') || msg.includes('unrecognized')
-    || msg.includes('not supported') || msg.includes('not a valid');
+function isAbort(err, ctx) {
+  return (err && err.name === 'AbortError') || !!(ctx.controller && ctx.controller.signal.aborted);
+}
+
+// Wait for a model `create()` while letting the current turn's Stop button end
+// the wait. The signal is deliberately NOT passed to `create()` itself: these
+// instances outlive the turn, and aborting a create signal destroys the object
+// it created.
+function untilAborted(promise, ctx) {
+  const signal = ctx.controller && ctx.controller.signal;
+  if (!signal) return promise;
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new DOMException('Stopped by the user.', 'AbortError'));
+    if (signal.aborted) onAbort();
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 // Lazily create (once) a persistent LanguageModel session seeded with the system
 // prompt + page content. The session is kept across turns so the Prompt API
 // retains conversation history, enabling coherent follow-up questions.
 async function getLanguageSession(config, ctx) {
-  if (ctx.baseSession) return ctx.baseSession;
-  const lm = languageModelApi();
-  const monitor = downloadMonitor(ctx);
-  const signal = ctx.controller ? ctx.controller.signal : undefined;
-  const systemPrompt = buildSystemPrompt(config);
-  try {
-    ctx.baseSession = await lm.create({
-      initialPrompts: [{ role: 'system', content: systemPrompt }],
-      monitor,
-      signal,
+  if (!ctx.sessionPromise) {
+    const pending = languageModelApi().create({
+      ...languageModelOptions(ctx.language),
+      initialPrompts: [{ role: 'system', content: buildSystemPrompt(config) }],
+      monitor: downloadMonitor(ctx),
     });
-  } catch (err) {
-    // Older builds took a `systemPrompt` string; only retry for that shape error.
-    if (!isOptionShapeError(err)) throw err;
-    ctx.baseSession = await lm.create({ systemPrompt, monitor, signal });
+    ctx.sessionPromise = pending;
+    // Don't keep a failed creation around — the next turn retries.
+    pending.catch(() => { if (ctx.sessionPromise === pending) ctx.sessionPromise = null; });
   }
-  return ctx.baseSession;
+  return untilAborted(ctx.sessionPromise, ctx);
+}
+
+function resetLanguageSession(ctx) {
+  const pending = ctx.sessionPromise;
+  ctx.sessionPromise = null;
+  if (pending) {
+    pending.then((s) => { if (typeof s.destroy === 'function') s.destroy(); }).catch(() => {});
+  }
 }
 
 // Did the session run out of context window? Deliberately narrow so unrelated
@@ -178,35 +231,13 @@ function isContextOverflow(err) {
     || msg.includes('exceeds');
 }
 
-// Consume a streaming AI response. Chrome ships two shapes — cumulative (each
-// chunk is the full text) and delta (each chunk is new) — so we detect once on
-// the second chunk and lock it, rather than re-guessing per chunk (which
-// corrupted output both ways).
+// Consume a streaming AI response. Every API that ships on the `window` globals
+// streams deltas (each chunk is new text), so chunks are simply appended.
 async function consumeStream(stream, onDelta) {
   let text = '';
-  let mode = null; // null (undecided) | 'cumulative' | 'delta'
-  let seen = false;
   // eslint-disable-next-line no-restricted-syntax
-  for await (const raw of stream) {
-    const chunk = typeof raw === 'string' ? raw : String(raw == null ? '' : raw);
-    if (!seen) {
-      // Chunk #1 is the full text so far under both shapes.
-      text = chunk;
-      seen = true;
-    } else if (mode === null) {
-      // Chunk #2 decides: cumulative re-sends the whole prefix; delta doesn't.
-      if (chunk.length >= text.length && chunk.startsWith(text)) {
-        mode = 'cumulative';
-        text = chunk;
-      } else {
-        mode = 'delta';
-        text += chunk;
-      }
-    } else if (mode === 'cumulative') {
-      text = chunk;
-    } else {
-      text += chunk;
-    }
+  for await (const chunk of stream) {
+    text += chunk;
     onDelta(text);
   }
   return text;
@@ -214,70 +245,114 @@ async function consumeStream(stream, onDelta) {
 
 // Stream one turn on the persistent session, so history accumulates and
 // follow-up questions stay coherent.
-async function streamTurn(session, question, controller, onDelta) {
-  const stream = session.promptStreaming(question, { signal: controller.signal });
+async function streamTurn(session, question, ctx, onDelta) {
+  const stream = session.promptStreaming(question, { signal: ctx.controller.signal });
   return consumeStream(stream, onDelta);
 }
 
-// Stream a grounded chat answer. The AbortController is owned by runAndStream
-// via `ctx.controller` so the Stop button can cancel.
-async function runChat(question, config, ctx, onDelta) {
-  const controller = ctx.controller || new AbortController();
+/**
+ * Stream a grounded chat answer on the shared session. The AbortController is
+ * owned by the UI via `ctx.controller` so the Stop button can cancel.
+ * @param {string} question the user's question
+ * @param {object} config normalised assistant config
+ * @param {object} ctx assistant runtime context
+ * @param {function(string)} onDelta receives the full answer so far
+ * @returns {Promise<string>} the complete answer
+ */
+export async function runChat(question, config, ctx, onDelta) {
   try {
     // Inside the try so an overflow on the first (largest) create is recovered.
     const session = await getLanguageSession(config, ctx);
-    return await streamTurn(session, question, controller, onDelta);
+    return await streamTurn(session, question, ctx, onDelta);
   } catch (err) {
     // Overflow recovery: rebuild a fresh session (grounding intact) and retry once.
-    if (controller.signal.aborted || !isContextOverflow(err)) throw err;
-    if (ctx.baseSession && typeof ctx.baseSession.destroy === 'function') {
-      try { ctx.baseSession.destroy(); } catch (e) { /* ignore */ }
-    }
-    ctx.baseSession = null;
+    if (isAbort(err, ctx) || !isContextOverflow(err)) throw err;
+    resetLanguageSession(ctx);
     const fresh = await getLanguageSession(config, ctx);
-    return streamTurn(fresh, question, controller, onDelta);
+    return streamTurn(fresh, question, ctx, onDelta);
   }
 }
 
-// Summarise the page. Prefer the dedicated Summarizer API; fall back to the
-// LanguageModel with a summarise instruction.
-async function runSummary(config, ctx, onDelta) {
+// Create an on-device helper (summarizer, translator, detector) once per key and
+// reuse it, rather than allocating a new model instance on every click.
+async function cachedTool(ctx, key, create) {
+  if (!ctx.tools.has(key)) {
+    const pending = create();
+    ctx.tools.set(key, pending);
+    // Don't cache failures — let the next use retry.
+    pending.catch(() => ctx.tools.delete(key));
+  }
+  return untilAborted(ctx.tools.get(key), ctx);
+}
+
+// Record a turn produced outside the chat session (e.g. by the Summarizer) in
+// the session history, so follow-ups like "expand on the second point" work.
+async function rememberTurn(config, ctx, prompt, answer) {
+  try {
+    const session = await getLanguageSession(config, ctx);
+    if (typeof session.append === 'function') {
+      await session.append([
+        { role: 'user', content: prompt },
+        { role: 'assistant', content: answer },
+      ]);
+    }
+  } catch (err) {
+    // Best effort: the summary is already shown.
+  }
+}
+
+/**
+ * Summarise the page. Prefers the dedicated Summarizer API; falls back to the
+ * LanguageModel with a summarise instruction.
+ * @param {object} config normalised assistant config
+ * @param {object} ctx assistant runtime context
+ * @param {function(string)} onDelta receives the full summary so far
+ * @returns {Promise<string>} the complete summary
+ */
+export async function runSummary(config, ctx, onDelta) {
   const pageText = extractPageText(config.maxContextChars);
   const summarizer = summarizerApi();
+  const signal = ctx.controller ? ctx.controller.signal : undefined;
+  const prompt = 'Summarise this page.';
 
   if (summarizer) {
+    const options = {
+      type: config.summaryType,
+      format: 'markdown',
+      length: 'medium',
+      expectedInputLanguages: [ctx.language],
+      outputLanguage: ctx.language,
+    };
+    let text = null;
     try {
       let state = 'available';
       if (typeof summarizer.availability === 'function') {
-        state = await summarizer.availability();
+        state = await summarizer.availability(options);
       }
       // Honour `showWhenDownloadable`: don't trigger a download the site opted
       // out of — fall through to the already-available LanguageModel instead.
-      const usable = state === 'available'
-        || (state === 'downloadable' && config.showWhenDownloadable);
-      if (usable) {
-        const signal = ctx.controller ? ctx.controller.signal : undefined;
-        const s = await summarizer.create({
-          type: config.summaryType || 'tldr',
-          format: 'plain-text',
-          length: 'medium',
+      if (state === 'available' || (isDownloadState(state) && config.showWhenDownloadable)) {
+        const s = await cachedTool(ctx, `summarizer:${config.summaryType}`, () => summarizer.create({
+          ...options,
           monitor: downloadMonitor(ctx),
-          signal,
-        });
-        if (typeof s.summarizeStreaming === 'function') {
-          return consumeStream(s.summarizeStreaming(pageText, { signal }), onDelta);
-        }
-        const text = await s.summarize(pageText, { signal });
+        }));
+        text = typeof s.summarizeStreaming === 'function'
+          ? await consumeStream(s.summarizeStreaming(pageText, { signal }), onDelta)
+          : await s.summarize(pageText, { signal });
         onDelta(text);
-        return text;
       }
     } catch (err) {
-      // Fall through to the LanguageModel path.
+      // A user Stop must stop — not silently start a second generation.
+      if (isAbort(err, ctx)) throw err;
+      // Otherwise fall through to the LanguageModel path.
+    }
+    if (text != null) {
+      await rememberTurn(config, ctx, prompt, text);
+      return text;
     }
   }
 
-  // Fallback: ask the Prompt API to summarise.
-  return runChat('Summarise this page in a few clear sentences.', config, ctx, onDelta);
+  return runChat(`${prompt} Use a few clear sentences.`, config, ctx, onDelta);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,31 +375,25 @@ const TRANSLATE_LANGUAGES = [
   { code: 'zh', name: 'Chinese' },
 ];
 
-function translatorApi() {
-  return window.Translator || (window.ai && window.ai.translator) || null;
-}
-
-function languageDetectorApi() {
-  return window.LanguageDetector || (window.ai && window.ai.languageDetector) || null;
-}
-
-// Detect the language of a string; falls back to 'en' when detection is
-// unavailable or inconclusive.
-async function detectLanguage(text) {
+// Detect the language of a string; falls back to the model language when
+// detection is unavailable or inconclusive.
+async function detectLanguage(text, ctx) {
   const detector = languageDetectorApi();
-  if (!detector) return 'en';
+  if (!detector) return ctx.language;
   try {
-    const det = await detector.create();
-    const results = await det.detect(text);
-    const top = Array.isArray(results) ? results[0] : null;
-    return (top && top.detectedLanguage) || 'en';
+    const det = await cachedTool(ctx, 'detector', () => detector.create({ monitor: downloadMonitor(ctx) }));
+    const [top] = await det.detect(text);
+    const code = top && top.confidence >= 0.5 ? top.detectedLanguage : '';
+    return code && code !== 'und' ? code : ctx.language;
   } catch (err) {
-    return 'en';
+    return ctx.language;
   }
 }
 
 // Translate the last assistant answer into targetLanguage, streaming the result.
-async function runTranslate(targetLanguage, config, ctx, onDelta) {
+// The language pack may need a one-time download; that is allowed here because
+// picking a language is an explicit user request, and progress is shown.
+async function runTranslate(targetLanguage, ctx, onDelta) {
   const source = (ctx.lastAnswer || '').trim();
   if (!source) {
     throw new Error('Ask a question or summarise the page first, then translate the answer.');
@@ -332,32 +401,26 @@ async function runTranslate(targetLanguage, config, ctx, onDelta) {
   const translator = translatorApi();
   if (!translator) throw new Error('Translation is not available in this browser.');
 
-  const sourceLanguage = await detectLanguage(source);
+  const sourceLanguage = await detectLanguage(source, ctx);
   if (sourceLanguage === targetLanguage) {
     onDelta(source);
     return source;
   }
 
+  const pair = { sourceLanguage, targetLanguage };
   let availability = 'available';
   if (typeof translator.availability === 'function') {
-    availability = await translator.availability({ sourceLanguage, targetLanguage });
+    availability = await translator.availability(pair);
   }
   if (availability === 'unavailable') {
     throw new Error(`Translation ${sourceLanguage} → ${targetLanguage} isn’t supported on this device.`);
   }
-  // Honour `showWhenDownloadable`: no non-downloading fallback exists here, so
-  // surface a clear message rather than triggering the opted-out download.
-  if (availability === 'downloadable' && !config.showWhenDownloadable) {
-    throw new Error('Translation needs a one-time on-device model download, which is disabled for this page.');
-  }
 
   const signal = ctx.controller ? ctx.controller.signal : undefined;
-  const t = await translator.create({
-    sourceLanguage,
-    targetLanguage,
+  const t = await cachedTool(ctx, `translator:${sourceLanguage}:${targetLanguage}`, () => translator.create({
+    ...pair,
     monitor: downloadMonitor(ctx),
-    signal,
-  });
+  }));
 
   if (typeof t.translateStreaming === 'function') {
     return consumeStream(t.translateStreaming(source, { signal }), onDelta);
@@ -400,7 +463,7 @@ function renderInline(text) {
     .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
     .replace(/__([\s\S]+?)__/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, '$1<em>$2</em>')
-    .replace(/(^|[^_])_([^_\s][^_]*?)_/g, '$1<em>$2</em>')
+    .replace(/(^|[^_\w])_([^_\s][^_]*?)_(?!\w)/g, '$1<em>$2</em>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   // Restore code spans last, untouched by emphasis/link processing.
   return out.replace(
@@ -458,16 +521,19 @@ function renderMarkdown(md) {
     }
 
     const ul = line.match(/^\s*[-*+]\s+(.*)$/);
-    const ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    const ol = line.match(/^\s*(\d+)\.\s+(.*)$/);
     if (ul || ol) {
       flushPara();
       const type = ul ? 'ul' : 'ol';
       if (listType && listType !== type) flushList();
       if (!listType) {
-        html.push(`<${type}>`);
+        // Models often separate numbered items with blank lines, which closes
+        // the list; `start` keeps the numbering continuous across the break.
+        const start = ol && Number(ol[1]) !== 1 ? ` start="${Number(ol[1])}"` : '';
+        html.push(`<${type}${start}>`);
         listType = type;
       }
-      html.push(`<li>${renderInline((ul || ol)[1])}</li>`);
+      html.push(`<li>${renderInline(ul ? ul[1] : ol[2])}</li>`);
       return;
     }
 
@@ -488,11 +554,11 @@ function renderMarkdown(md) {
 }
 
 // ---------------------------------------------------------------------------
-// Action registry — extensible list of one-click actions in the panel header.
-// Add new actions here (or push to it before mounting) and they render
+// Action registry — extensible list of one-click actions in the panel. Push to
+// it (it is exported) before the assistant mounts and new actions render
 // automatically.
 // ---------------------------------------------------------------------------
-const ACTIONS = [
+export const ACTIONS = [
   {
     id: 'summarise',
     label: 'Summarise this page',
@@ -538,9 +604,8 @@ function applyAccent(root, config) {
   );
 }
 
-function buildUI(config, ctx) {
+function buildUI(config) {
   const root = el('div', `page-assistant page-assistant-root page-assistant-${config.position}`);
-  root.setAttribute('data-state', ctx.state);
   applyAccent(root, config);
 
   // Floating bubble button.
@@ -548,10 +613,12 @@ function buildUI(config, ctx) {
   bubble.type = 'button';
   bubble.setAttribute('aria-label', `Open ${config.title}`);
   bubble.setAttribute('aria-expanded', 'false');
+  bubble.setAttribute('aria-controls', 'page-assistant-panel');
   bubble.innerHTML = `<span class="page-assistant-bubble-icon page-assistant-icon-chat">${ICONS.chat}</span><span class="page-assistant-bubble-icon page-assistant-icon-chevron">${ICONS.chevron}</span>`;
 
   // Panel.
   const panel = el('div', 'page-assistant-panel');
+  panel.id = 'page-assistant-panel';
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', config.title);
   panel.setAttribute('aria-modal', 'false');
@@ -570,6 +637,7 @@ function buildUI(config, ctx) {
   clearBtn.innerHTML = ICONS.clear;
   const closeBtn = el('button', 'page-assistant-close');
   closeBtn.type = 'button';
+  closeBtn.title = 'Close';
   closeBtn.setAttribute('aria-label', 'Close');
   closeBtn.innerHTML = ICONS.close;
   headerBtns.append(clearBtn, closeBtn);
@@ -649,6 +717,8 @@ function addMessage(transcript, role, text, markdown) {
 
 function setBusy(ui, busy) {
   ui.root.classList.toggle('page-assistant-busy', busy);
+  // Screen readers announce the finished answer once, not every streamed chunk.
+  ui.transcript.setAttribute('aria-busy', String(busy));
   // Send stays enabled while streaming and doubles as a Stop control so the user
   // can cancel a slow/stuck generation (see the submit handler).
   ui.send.classList.toggle('page-assistant-send-stop', busy);
@@ -656,6 +726,12 @@ function setBusy(ui, busy) {
   ui.send.innerHTML = busy ? ICONS.stop : ICONS.send;
   ui.clearBtn.disabled = busy;
   ui.actionsRow.querySelectorAll('button, select').forEach((b) => { b.disabled = busy; });
+}
+
+// Grow the textarea with its content (up to the CSS max-height).
+function autosize(input) {
+  input.style.height = 'auto';
+  input.style.height = `${input.scrollHeight + input.offsetHeight - input.clientHeight}px`;
 }
 
 function wireUI(ui, config, ctx) {
@@ -680,8 +756,8 @@ function wireUI(ui, config, ctx) {
     else openPanel();
   });
   ui.closeBtn.addEventListener('click', closePanel);
-  ui.panel.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closePanel();
+  ui.root.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isOpen()) closePanel();
   });
 
   // Clear chat: empty the transcript, forget the last answer, and drop the base
@@ -690,16 +766,20 @@ function wireUI(ui, config, ctx) {
     if (ctx.busy) return;
     ui.transcript.replaceChildren();
     ctx.lastAnswer = '';
-    if (ctx.baseSession && typeof ctx.baseSession.destroy === 'function') {
-      try { ctx.baseSession.destroy(); } catch (err) { /* ignore */ }
-    }
-    ctx.baseSession = null;
+    resetLanguageSession(ctx);
     ui.input.focus();
   });
 
   // Progress feedback (e.g. one-time model preparation) surfaces as status text.
   ctx.onProgress = (pct) => {
-    if (ctx.statusMsg) ctx.statusMsg.textContent = `Preparing on-device AI… ${pct}%`;
+    if (ctx.statusMsg && pct < 100) ctx.statusMsg.textContent = `Preparing on-device AI… ${pct}%`;
+  };
+
+  // Follow the stream only while the reader is at the bottom, so scrolling up to
+  // re-read an earlier answer isn't yanked away by every new chunk.
+  const isNearBottom = () => {
+    const t = ui.transcript;
+    return t.scrollHeight - t.scrollTop - t.clientHeight < 48;
   };
 
   const runAndStream = async (runner, userLabel, opts = {}) => {
@@ -709,64 +789,59 @@ function wireUI(ui, config, ctx) {
     ctx.controller = new AbortController();
     setBusy(ui, true);
     if (userLabel) addMessage(ui.transcript, 'user', userLabel);
-    ctx.statusMsg = addMessage(ui.transcript, 'assistant', '');
-    ctx.statusMsg.classList.add('page-assistant-status');
-    ctx.statusMsg.innerHTML = '<span class="page-assistant-typing"><i></i><i></i><i></i></span>';
+    const msg = addMessage(ui.transcript, 'assistant', '');
+    ctx.statusMsg = msg;
+    msg.classList.add('page-assistant-status');
+    msg.innerHTML = '<span class="page-assistant-typing"><i></i><i></i><i></i></span>';
+
+    const render = (text) => {
+      const follow = isNearBottom();
+      msg.classList.remove('page-assistant-status');
+      msg.classList.add('page-assistant-markdown');
+      setContent(msg, text, true);
+      if (follow) ui.transcript.scrollTop = ui.transcript.scrollHeight;
+    };
+    const renderNote = (text, isError) => {
+      msg.classList.remove('page-assistant-status', 'page-assistant-markdown');
+      msg.classList.toggle('page-assistant-error', !!isError);
+      msg.textContent = text;
+    };
 
     // Coalesce renders to at most one per frame — re-rendering the whole answer
     // and forcing a scroll reflow on every chunk is O(n²) and janky.
     let finalText = '';
-    let pending = null;
     let rafId = 0;
-    let first = true;
-    const paint = () => {
-      rafId = 0;
-      if (pending == null) return;
-      const text = pending;
-      pending = null;
-      if (first) {
-        ctx.statusMsg.classList.remove('page-assistant-status');
-        ctx.statusMsg.classList.add('page-assistant-markdown');
-        first = false;
-      }
-      setContent(ctx.statusMsg, text, true);
-      ui.transcript.scrollTop = ui.transcript.scrollHeight;
-    };
     const stopPaint = () => { if (rafId) { cancelAnimationFrame(rafId); rafId = 0; } };
 
     try {
       await runner((text) => {
         finalText = text;
-        pending = text;
-        if (!rafId) rafId = requestAnimationFrame(paint);
+        if (!rafId) {
+          rafId = requestAnimationFrame(() => {
+            rafId = 0;
+            render(finalText);
+          });
+        }
       });
       stopPaint();
-      // Final render of the complete answer.
-      if (finalText) {
-        if (first) {
-          ctx.statusMsg.classList.remove('page-assistant-status');
-          ctx.statusMsg.classList.add('page-assistant-markdown');
-        }
-        setContent(ctx.statusMsg, finalText, true);
-        ui.transcript.scrollTop = ui.transcript.scrollHeight;
+      if (finalText.trim()) {
+        render(finalText);
+        if (track) ctx.lastAnswer = finalText;
+      } else {
+        renderNote('No answer came back. Try rephrasing your question.');
       }
-      if (track && finalText.trim()) ctx.lastAnswer = finalText;
     } catch (err) {
       stopPaint();
-      if (err && err.name === 'AbortError') {
+      if (isAbort(err, ctx)) {
         // Stopped by the user: keep whatever streamed, else a subtle note.
         if (finalText.trim()) {
-          if (first) ctx.statusMsg.classList.add('page-assistant-markdown');
-          setContent(ctx.statusMsg, finalText, true);
+          render(finalText);
           if (track) ctx.lastAnswer = finalText;
         } else {
-          ctx.statusMsg.classList.remove('page-assistant-markdown');
-          ctx.statusMsg.textContent = 'Stopped.';
+          renderNote('Stopped.');
         }
       } else {
-        ctx.statusMsg.classList.remove('page-assistant-markdown');
-        ctx.statusMsg.textContent = `Sorry — ${err.message}`;
-        ctx.statusMsg.classList.add('page-assistant-error');
+        renderNote(`Sorry — ${(err && err.message) || 'something went wrong.'}`, true);
       }
     } finally {
       ctx.busy = false;
@@ -792,7 +867,7 @@ function wireUI(ui, config, ctx) {
       const name = (lang && lang.name) || targetLanguage;
       e.target.value = '';
       runAndStream(
-        (onDelta) => runTranslate(targetLanguage, config, ctx, onDelta),
+        (onDelta) => runTranslate(targetLanguage, ctx, onDelta),
         `Translate answer → ${name}`,
         { track: false },
       );
@@ -810,13 +885,17 @@ function wireUI(ui, config, ctx) {
     const question = ui.input.value.trim();
     if (!question) return;
     ui.input.value = '';
+    autosize(ui.input);
     runAndStream((onDelta) => runChat(question, config, ctx, onDelta), question);
   });
 
+  ui.input.addEventListener('input', () => autosize(ui.input));
+
   // Enter to send, Shift+Enter for newline. Ignored while streaming so a typed
   // follow-up is preserved rather than silently cleared (use Stop to cancel).
+  // Also ignored mid-IME-composition, where Enter confirms a candidate.
   ui.input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       if (ctx.busy) return;
       ui.form.requestSubmit();
@@ -840,10 +919,14 @@ function globalBaseConfig() {
 // Normalise a partial config object against the defaults.
 function normaliseConfig(partial) {
   const cfg = { ...DEFAULT_CONFIG, ...(partial || {}) };
+  const keyword = (v) => String(v).trim().toLowerCase().replace(/[\s_]+/g, '-');
   // Tolerate "8,000" and reject nonsensical values (0/negative) via the default.
   const n = parseInt(String(cfg.maxContextChars).replace(/[,\s_]/g, ''), 10);
   cfg.maxContextChars = Number.isFinite(n) && n >= 1 ? n : DEFAULT_CONFIG.maxContextChars;
-  cfg.position = cfg.position === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+  cfg.position = keyword(cfg.position) === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+  // Accept authored spellings like "Key Points"; unknown types use the default.
+  const summaryType = keyword(cfg.summaryType);
+  cfg.summaryType = SUMMARY_TYPES.includes(summaryType) ? summaryType : DEFAULT_CONFIG.summaryType;
   if (typeof cfg.showWhenDownloadable === 'string') {
     cfg.showWhenDownloadable = /^(true|yes|on)$/i.test(cfg.showWhenDownloadable.trim());
   }
@@ -857,12 +940,11 @@ function normaliseConfig(partial) {
  * @returns {Promise<boolean>} true if mounted, false if skipped
  */
 export async function mountAssistant(partialConfig) {
-  if (window[MOUNT_FLAG]) return false;
-  if (!builtinPresent()) return false;
+  if (window[MOUNT_FLAG] || !languageModelApi()) return false;
 
   const config = normaliseConfig(partialConfig);
-  const { ok, state } = await probeAvailability();
-  if (!ok || !shouldRender(state, config)) return false;
+  const { state, language } = await probeAvailability();
+  if (!shouldRender(state, config)) return false;
 
   // Claim the singleton only once we know we will actually render.
   if (window[MOUNT_FLAG]) return false;
@@ -870,8 +952,14 @@ export async function mountAssistant(partialConfig) {
 
   try {
     await loadCSS(`${window.hlx.codeBasePath}/blocks/page-assistant/page-assistant.css`);
-    const ctx = { state, busy: false, baseSession: null };
-    const ui = buildUI(config, ctx);
+    const ctx = {
+      state,
+      language,
+      busy: false,
+      sessionPromise: null,
+      tools: new Map(),
+    };
+    const ui = buildUI(config);
     wireUI(ui, config, ctx);
     document.body.append(ui.root);
     return true;
@@ -882,20 +970,12 @@ export async function mountAssistant(partialConfig) {
   }
 }
 
-/**
- * Global helper for scripts.js: mount the assistant on pages whose pathname
- * matches one of the given regex patterns. Runs on idle so it never touches the
- * critical path.
- * @param {Array<RegExp|string>} patterns regexes (or strings) tested against location.pathname
- * @param {object} [config] optional config overrides
- */
-/**
- * True when an authored `page-assistant` block exists on the page — either still
- * pending decoration ([data-block-name]) or already mounted (.page-assistant-root).
- * The global auto-mount uses this to always defer to an authored instance.
- */
+// True when an authored `page-assistant` block exists on the page — claimed by
+// `decorate`, still pending decoration, or already mounted. The global
+// auto-mount uses this to always defer to an authored instance.
 function authoredInstanceExists() {
-  return !!document.querySelector('[data-block-name="page-assistant"], .page-assistant-root');
+  return !!window[AUTHORED_FLAG]
+    || !!document.querySelector('[data-block-name="page-assistant"], .page-assistant-root');
 }
 
 // Path matcher: a RegExp is used as-is; a string is an anchored glob (`*`/`?`),
@@ -907,6 +987,14 @@ function pathMatcher(pattern) {
   return new RegExp(`^${glob}$`);
 }
 
+/**
+ * Global helper for scripts.js: mount the assistant on pages whose pathname
+ * matches one of the given patterns. Runs on idle so it never touches the
+ * critical path. An authored block on the same page always wins.
+ * @param {Array<RegExp|string>} patterns regexes, or anchored globs, tested
+ *   against location.pathname
+ * @param {object} [config] optional config overrides
+ */
 export function autoMountByPath(patterns, config) {
   try {
     const list = (patterns || []).map(pathMatcher);
@@ -915,17 +1003,12 @@ export function autoMountByPath(patterns, config) {
     // Merge order for global pages: DEFAULT_CONFIG (in normaliseConfig)
     // <- window.pageAssistantConfig <- config passed here.
     const merged = { ...globalBaseConfig(), ...(config || {}) };
-    const run = () => {
+    onIdle(() => {
       // An authored block on this page always wins: skip the global mount so its
       // page-specific config takes precedence over the bulk configuration.
       if (window[MOUNT_FLAG] || authoredInstanceExists()) return;
       mountAssistant(merged).catch(() => { /* never break the page */ });
-    };
-    if (typeof window.requestIdleCallback === 'function') {
-      window.requestIdleCallback(run, { timeout: 3000 });
-    } else {
-      window.setTimeout(run, 1200);
-    }
+    });
   } catch (err) {
     // Never let the assistant break the page.
   }
@@ -934,12 +1017,13 @@ export function autoMountByPath(patterns, config) {
 /**
  * Authored block entry point. Reads config from the block, removes the authored
  * placeholder (the assistant renders as a floating overlay, not inline), and
- * mounts the shared assistant.
+ * mounts the shared assistant once the page is idle.
  * @param {Element} block the page-assistant block element
  */
-export default async function decorate(block) {
+export default function decorate(block) {
+  window[AUTHORED_FLAG] = true;
   const raw = readBlockConfig(block);
-  const str = (v) => (Array.isArray(v) ? v.join(', ') : `${v ?? ''}`).trim();
+  const str = (v) => (Array.isArray(v) ? v.join('\n') : `${v ?? ''}`).trim();
   const config = {
     subtext: str(raw.subtext) || undefined,
     systemPrompt: str(raw['system-prompt'] || raw.systemprompt) || undefined,
@@ -959,6 +1043,11 @@ export default async function decorate(block) {
   // base per page; unset fields inherit it (merge, not full replace).
   const merged = { ...globalBaseConfig(), ...config };
 
-  block.remove();
-  await mountAssistant(merged);
+  // Remove the placeholder along with its wrapper, and the section too if the
+  // block was all it held, so no empty, margined section is left behind.
+  const section = block.closest('.section');
+  (block.closest('.page-assistant-wrapper') || block).remove();
+  if (section && !section.querySelector(':scope > :not(.section-metadata)')) section.remove();
+
+  onIdle(() => mountAssistant(merged).catch(() => { /* never break the page */ }));
 }
