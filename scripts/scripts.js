@@ -200,12 +200,40 @@ async function loadLazy(doc) {
 }
 
 /**
+ * Shows the on-device page assistant on pages matching ASSISTANT_PATHS, with no
+ * authoring needed. Pages with an authored page-assistant block keep their own.
+ * Renders nothing unless the browser's built-in AI is available.
+ */
+function loadPageAssistant() {
+  const ASSISTANT_PATHS = ['/drafts/blog/*'];
+  if (!ASSISTANT_PATHS.length) return;
+  import('../blocks/page-assistant/page-assistant.js')
+    .then(({
+      autoMountByPath, ACTIONS, runSummary, runChat,
+    }) => {
+      ACTIONS.push({
+        id: 'key-points',
+        label: 'Key points',
+        run: (config, ctx, onDelta) => runSummary({ ...config, summaryType: 'key-points' }, ctx, onDelta),
+      });
+      ACTIONS.push({
+        id: 'suggest-questions',
+        label: 'Suggest questions',
+        run: (config, ctx, onDelta) => runChat('List three questions this page answers.', config, ctx, onDelta),
+      });
+      autoMountByPath(ASSISTANT_PATHS, { title: 'Blog assistant', accent: '#7c3aed' });
+    })
+    .catch(() => { /* never break the page */ });
+}
+
+/**
  * Loads everything that happens a lot later,
  * without impacting the user experience.
  */
 function loadDelayed() {
   import('./consent-check.js');
   // load anything that can be postponed to the latest here
+  loadPageAssistant();
 }
 
 async function loadPage() {
